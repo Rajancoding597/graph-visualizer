@@ -1,0 +1,28 @@
+{
+  "name": "graph-visualizer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Interactive React graph visualizer for edge lists, adjacency lists, matrices, JSON, and LeetCode-style inputs.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "framer-motion": "^12.23.26",
+    "lucide-react": "^0.562.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}
