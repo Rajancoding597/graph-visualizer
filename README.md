@@ -7,6 +7,7 @@ The app accepts multiple graph input formats, renders the graph in different lay
 ## Features
 
 - Visual graph rendering with Circle, Flow, and Grid layouts
+- Zoomable, pannable graph canvas with desktop wheel controls and mobile pinch gestures
 - Directed and undirected graph modes
 - Optional edge weights with thicker weighted lines
 - Node focus mode with neighbor highlighting

@@ -646,7 +646,54 @@ textarea:focus {
   color: hsl(var(--primary));
 }
 
+.zoom-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: end;
+  min-height: 38px;
+  padding: 3px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 30px;
+  min-width: 32px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--foreground));
+  padding: 0;
+}
+
+.icon-button:hover,
+.icon-button:focus {
+  background: hsl(var(--muted));
+  outline: none;
+}
+
+.icon-button:disabled {
+  cursor: not-allowed;
+  color: hsl(var(--muted-foreground));
+  opacity: 0.42;
+}
+
+.zoom-readout {
+  min-width: 48px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center;
+}
+
 .canvas-wrap {
+  position: relative;
   overflow: hidden;
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
@@ -701,6 +748,14 @@ textarea:focus {
   display: block;
   width: 100%;
   height: 560px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.graph-canvas.is-panning,
+.graph-canvas.is-panning .node-hit-area {
+  cursor: grabbing;
 }
 
 .grid-line {
@@ -1103,6 +1158,18 @@ tbody tr[tabindex]:focus td {
     min-height: 42px;
   }
 
+  .zoom-controls {
+    align-self: stretch;
+    justify-content: space-between;
+    min-height: 44px;
+  }
+
+  .icon-button {
+    width: 38px;
+    height: 36px;
+    min-width: 38px;
+  }
+
   input,
   select {
     min-height: 44px;
@@ -1187,14 +1254,13 @@ tbody tr[tabindex]:focus td {
   }
 
   .canvas-wrap {
-    overflow: auto;
+    overflow: hidden;
     border-radius: 10px;
-    -webkit-overflow-scrolling: touch;
-    touch-action: pan-x pan-y;
+    touch-action: none;
   }
 
   .graph-canvas {
-    width: max(100%, 620px);
+    width: 100%;
     max-width: none;
     height: min(62vh, 430px);
     min-height: 360px;
@@ -1392,7 +1458,7 @@ tbody tr[tabindex]:focus td {
   }
 
   .graph-canvas {
-    width: max(100%, 560px);
+    width: 100%;
     height: min(58vh, 390px);
     min-height: 330px;
   }

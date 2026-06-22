@@ -11,6 +11,7 @@ import {
   GitBranch,
   Info,
   LayoutGrid,
+  Maximize2,
   MousePointerClick,
   Play,
   RotateCcw,
@@ -19,6 +20,8 @@ import {
   Sparkles,
   Table2,
   Upload,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import {
   analyzeGraph,
@@ -35,6 +38,21 @@ import {
   type GraphFormat,
   type LayoutMode,
 } from "./graphLogic";
+import {
+  GRAPH_HEIGHT,
+  GRAPH_WIDTH,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  clampGraphScale,
+  clampGraphViewport,
+  defaultGraphViewport,
+  getNextZoomScale,
+  getViewportCenter,
+  panGraphViewport,
+  zoomGraphViewport,
+  type GraphPoint,
+  type GraphViewport,
+} from "./graphViewport";
 
 type MobileView = "graph" | "analyze" | "edit" | "data";
 
@@ -129,6 +147,23 @@ type SelectOption<T extends string> = {
   value: T;
   label: string;
   description?: string;
+};
+
+type StoredPointer = GraphPoint & {
+  pointerId: number;
+};
+
+type DragState = {
+  pointerId: number;
+  lastClientX: number;
+  lastClientY: number;
+  totalDistance: number;
+};
+
+type PinchState = {
+  distance: number;
+  focalPoint: GraphPoint;
+  viewport: GraphViewport;
 };
 
 function formatNumber(value: number | null, digits = 2) {
@@ -338,6 +373,49 @@ function downloadText(fileName: string, text: string, mimeType: string) {
   URL.revokeObjectURL(url);
 }
 
+function formatSvgNumber(value: number) {
+  return Number(value.toFixed(3)).toString();
+}
+
+function getGraphPointFromClient(svg: SVGSVGElement, viewport: GraphViewport, clientX: number, clientY: number) {
+  const rect = svg.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    return getViewportCenter(viewport);
+  }
+
+  return {
+    x: viewport.x + ((clientX - rect.left) / rect.width) * (GRAPH_WIDTH / viewport.scale),
+    y: viewport.y + ((clientY - rect.top) / rect.height) * (GRAPH_HEIGHT / viewport.scale),
+  };
+}
+
+function getPointerDistance(left: StoredPointer, right: StoredPointer) {
+  return Math.hypot(left.x - right.x, left.y - right.y);
+}
+
+function getPointerMidpoint(left: StoredPointer, right: StoredPointer): GraphPoint {
+  return {
+    x: (left.x + right.x) / 2,
+    y: (left.y + right.y) / 2,
+  };
+}
+
+function getFirstTwoPointers(pointers: Map<number, StoredPointer>) {
+  return Array.from(pointers.values()).slice(0, 2);
+}
+
+function normalizeWheelDelta(event: React.WheelEvent<SVGSVGElement>) {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+    return event.deltaY * 16;
+  }
+
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+    return event.deltaY * GRAPH_HEIGHT;
+  }
+
+  return event.deltaY;
+}
+
 export default function GraphVisualizerUI() {
   const [input, setInput] = useState(EXAMPLES["edge-list"].input);
   const [inputFormat, setInputFormat] = useState<GraphFormat>("edge-list");
@@ -356,6 +434,18 @@ export default function GraphVisualizerUI() {
   const [notice, setNotice] = useState("");
   const [mobileView, setMobileView] = useState<MobileView>("graph");
   const [showExportPreview, setShowExportPreview] = useState(false);
+  const [graphViewport, setGraphViewport] = useState<GraphViewport>(defaultGraphViewport);
+  const [isGraphPanning, setIsGraphPanning] = useState(false);
+  const graphCanvasRef = useRef<SVGSVGElement | null>(null);
+  const graphViewportRef = useRef<GraphViewport>(defaultGraphViewport());
+  const activePointersRef = useRef(new Map<number, StoredPointer>());
+  const dragStateRef = useRef<DragState | null>(null);
+  const pinchStateRef = useRef<PinchState | null>(null);
+  const suppressNodeClickRef = useRef(false);
+
+  useEffect(() => {
+    graphViewportRef.current = graphViewport;
+  }, [graphViewport]);
 
   const parsed = useMemo(
     () => parseGraph(submitted.input, submitted.format),
@@ -372,7 +462,7 @@ export default function GraphVisualizerUI() {
 
   const layout = useMemo(
     // Focus is visual only. Feeding it into Flow would re-root the layout and make the graph jump.
-    () => buildLayout(nodes, 960, 560, layoutMode, edges, directed),
+    () => buildLayout(nodes, GRAPH_WIDTH, GRAPH_HEIGHT, layoutMode, edges, directed),
     [nodes, edges, directed, layoutMode]
   );
   const nodeMap = useMemo(() => new Map(layout.map((node) => [node.id, node])), [layout]);
@@ -406,11 +496,193 @@ export default function GraphVisualizerUI() {
     { value: "json", label: "JSON" },
     { value: "edge-list", label: "Edge list" },
   ];
+  const graphViewBox = useMemo(
+    () =>
+      [
+        graphViewport.x,
+        graphViewport.y,
+        GRAPH_WIDTH / graphViewport.scale,
+        GRAPH_HEIGHT / graphViewport.scale,
+      ]
+        .map(formatSvgNumber)
+        .join(" "),
+    [graphViewport]
+  );
+  const zoomLabel = `${Math.round(graphViewport.scale * 100)}%`;
+
+  const resetGraphViewport = useCallback(() => {
+    activePointersRef.current.clear();
+    dragStateRef.current = null;
+    pinchStateRef.current = null;
+    suppressNodeClickRef.current = false;
+    setIsGraphPanning(false);
+    setGraphViewport(defaultGraphViewport());
+  }, []);
+
+  const handleLayoutModeChange = (nextLayoutMode: LayoutMode) => {
+    setLayoutMode(nextLayoutMode);
+    resetGraphViewport();
+  };
+
+  const handleDirectedChange = (isDirected: boolean) => {
+    setDirected(isDirected);
+    resetGraphViewport();
+  };
+
+  const handleZoomStep = (direction: -1 | 1) => {
+    setGraphViewport((current) =>
+      zoomGraphViewport(current, getNextZoomScale(current.scale, direction), getViewportCenter(current))
+    );
+  };
+
+  const startPinchGesture = useCallback(() => {
+    const svg = graphCanvasRef.current;
+    const [firstPointer, secondPointer] = getFirstTwoPointers(activePointersRef.current);
+    if (!svg || !firstPointer || !secondPointer) return;
+
+    const midpoint = getPointerMidpoint(firstPointer, secondPointer);
+    const viewport = graphViewportRef.current;
+    pinchStateRef.current = {
+      distance: getPointerDistance(firstPointer, secondPointer),
+      focalPoint: getGraphPointFromClient(svg, viewport, midpoint.x, midpoint.y),
+      viewport,
+    };
+  }, []);
+
+  const handleGraphWheel = (event: React.WheelEvent<SVGSVGElement>) => {
+    event.preventDefault();
+    const svg = graphCanvasRef.current;
+    if (!svg) return;
+
+    const clientX = event.clientX;
+    const clientY = event.clientY;
+    const delta = normalizeWheelDelta(event);
+    setGraphViewport((current) => {
+      const focalPoint = getGraphPointFromClient(svg, current, clientX, clientY);
+      return zoomGraphViewport(current, current.scale * Math.exp(-delta * 0.0015), focalPoint);
+    });
+  };
+
+  const handleGraphPointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
+    const pointer = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    activePointersRef.current.set(event.pointerId, pointer);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsGraphPanning(true);
+
+    if (activePointersRef.current.size === 1) {
+      dragStateRef.current = {
+        pointerId: event.pointerId,
+        lastClientX: event.clientX,
+        lastClientY: event.clientY,
+        totalDistance: 0,
+      };
+      pinchStateRef.current = null;
+      return;
+    }
+
+    suppressNodeClickRef.current = true;
+    dragStateRef.current = null;
+    startPinchGesture();
+  };
+
+  const handleGraphPointerMove = (event: React.PointerEvent<SVGSVGElement>) => {
+    if (!activePointersRef.current.has(event.pointerId)) return;
+
+    activePointersRef.current.set(event.pointerId, {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+    });
+
+    const svg = graphCanvasRef.current;
+    if (!svg) return;
+
+    const [firstPointer, secondPointer] = getFirstTwoPointers(activePointersRef.current);
+    const pinchState = pinchStateRef.current;
+    if (activePointersRef.current.size >= 2 && firstPointer && secondPointer && pinchState) {
+      const distance = getPointerDistance(firstPointer, secondPointer);
+      if (pinchState.distance > 0 && distance > 0) {
+        const midpoint = getPointerMidpoint(firstPointer, secondPointer);
+        const rect = svg.getBoundingClientRect();
+        const scale = clampGraphScale(pinchState.viewport.scale * (distance / pinchState.distance));
+        const visibleWidth = GRAPH_WIDTH / scale;
+        const visibleHeight = GRAPH_HEIGHT / scale;
+        const normalizedX = rect.width === 0 ? 0.5 : (midpoint.x - rect.left) / rect.width;
+        const normalizedY = rect.height === 0 ? 0.5 : (midpoint.y - rect.top) / rect.height;
+
+        setGraphViewport(
+          clampGraphViewport({
+            x: pinchState.focalPoint.x - normalizedX * visibleWidth,
+            y: pinchState.focalPoint.y - normalizedY * visibleHeight,
+            scale,
+          })
+        );
+        suppressNodeClickRef.current = true;
+      }
+      return;
+    }
+
+    const dragState = dragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+
+    const deltaX = event.clientX - dragState.lastClientX;
+    const deltaY = event.clientY - dragState.lastClientY;
+    dragState.totalDistance += Math.hypot(deltaX, deltaY);
+    dragState.lastClientX = event.clientX;
+    dragState.lastClientY = event.clientY;
+
+    if (dragState.totalDistance > 4) {
+      suppressNodeClickRef.current = true;
+    }
+
+    const rect = svg.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      setGraphViewport((current) =>
+        panGraphViewport(current, { x: deltaX, y: deltaY }, { width: rect.width, height: rect.height })
+      );
+    }
+  };
+
+  const handleGraphPointerEnd = (event: React.PointerEvent<SVGSVGElement>) => {
+    const dragState = dragStateRef.current;
+    const shouldSuppressClick =
+      activePointersRef.current.size > 1 || Boolean(pinchStateRef.current) || (dragState?.totalDistance ?? 0) > 4;
+
+    activePointersRef.current.delete(event.pointerId);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (activePointersRef.current.size >= 2) {
+      startPinchGesture();
+    } else if (activePointersRef.current.size === 1) {
+      const remainingPointer = Array.from(activePointersRef.current.values())[0];
+      dragStateRef.current = {
+        pointerId: remainingPointer.pointerId,
+        lastClientX: remainingPointer.x,
+        lastClientY: remainingPointer.y,
+        totalDistance: shouldSuppressClick ? 5 : 0,
+      };
+      pinchStateRef.current = null;
+    } else {
+      dragStateRef.current = null;
+      pinchStateRef.current = null;
+      setIsGraphPanning(false);
+    }
+
+    if (shouldSuppressClick) {
+      suppressNodeClickRef.current = true;
+      window.setTimeout(() => {
+        suppressNodeClickRef.current = false;
+      }, 0);
+    }
+  };
 
   const handleRender = () => {
     setSubmitted({ input, format: inputFormat });
     setNotice(`Rendered ${FORMAT_LABELS[inputFormat].toLowerCase()} input.`);
     setMobileView("graph");
+    resetGraphViewport();
   };
 
   const handleReset = () => {
@@ -428,6 +700,7 @@ export default function GraphVisualizerUI() {
     setMobileView("graph");
     setShowExportPreview(false);
     setNotice("");
+    resetGraphViewport();
   };
 
   const applyExample = (format: GraphFormat) => {
@@ -440,6 +713,7 @@ export default function GraphVisualizerUI() {
     setTargetNode("");
     setMobileView("graph");
     setNotice(`Loaded ${FORMAT_LABELS[format].toLowerCase()} sample.`);
+    resetGraphViewport();
   };
 
   const handleDetectFormat = () => {
@@ -465,6 +739,7 @@ export default function GraphVisualizerUI() {
     setTargetNode("");
     setMobileView("graph");
     setNotice(`Uploaded ${file.name} as ${FORMAT_LABELS[detected].toLowerCase()}.`);
+    resetGraphViewport();
   };
 
   const copyExport = async () => {
@@ -484,6 +759,11 @@ export default function GraphVisualizerUI() {
   };
 
   const handleNodeFocus = (nodeId: string) => {
+    if (suppressNodeClickRef.current) {
+      suppressNodeClickRef.current = false;
+      return;
+    }
+
     setFocusNode(nodeId === effectiveFocus ? "" : nodeId);
   };
 
@@ -644,7 +924,7 @@ export default function GraphVisualizerUI() {
                 <input
                   type="checkbox"
                   checked={directed}
-                  onChange={(event) => setDirected(event.target.checked)}
+                  onChange={(event) => handleDirectedChange(event.target.checked)}
                 />
                 Directed
               </label>
@@ -732,7 +1012,7 @@ export default function GraphVisualizerUI() {
                     ariaLabel="Layout"
                     value={layoutMode}
                     options={layoutOptions}
-                    onChange={setLayoutMode}
+                    onChange={handleLayoutModeChange}
                   />
                 </div>
                 <div className="select-field">
@@ -743,6 +1023,40 @@ export default function GraphVisualizerUI() {
                     options={focusOptions}
                     onChange={setFocusNode}
                   />
+                </div>
+                <div className="zoom-controls" aria-label="Graph zoom controls">
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={() => handleZoomStep(-1)}
+                    disabled={graphViewport.scale <= MIN_ZOOM}
+                    aria-label="Zoom out"
+                    title="Zoom out"
+                  >
+                    <ZoomOut size={16} />
+                  </button>
+                  <span className="zoom-readout" aria-live="polite">
+                    {zoomLabel}
+                  </span>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={() => handleZoomStep(1)}
+                    disabled={graphViewport.scale >= MAX_ZOOM}
+                    aria-label="Zoom in"
+                    title="Zoom in"
+                  >
+                    <ZoomIn size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={resetGraphViewport}
+                    aria-label="Fit graph"
+                    title="Fit graph"
+                  >
+                    <Maximize2 size={16} />
+                  </button>
                 </div>
               </div>
             </div>
@@ -767,7 +1081,18 @@ export default function GraphVisualizerUI() {
             </div>
 
             <div className="canvas-wrap">
-              <svg viewBox="0 0 960 560" className="graph-canvas" role="img" aria-label="Rendered graph">
+              <svg
+                ref={graphCanvasRef}
+                viewBox={graphViewBox}
+                className={`graph-canvas${isGraphPanning ? " is-panning" : ""}`}
+                role="img"
+                aria-label="Rendered graph"
+                onWheel={handleGraphWheel}
+                onPointerDown={handleGraphPointerDown}
+                onPointerMove={handleGraphPointerMove}
+                onPointerUp={handleGraphPointerEnd}
+                onPointerCancel={handleGraphPointerEnd}
+              >
                 <defs>
                   <marker id="arrow-default" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
                     <path d="M 0 0 L 10 5 L 0 10 z" fill="hsl(224 18% 42%)" />
@@ -780,15 +1105,15 @@ export default function GraphVisualizerUI() {
                   </marker>
                 </defs>
 
-                {Array.from({ length: 13 }).map((_, index) => (
-                  <line key={`v-${index}`} className="grid-line" x1={index * 80} y1={0} x2={index * 80} y2={560} />
+                {Array.from({ length: Math.floor(GRAPH_WIDTH / 80) + 1 }).map((_, index) => (
+                  <line key={`v-${index}`} className="grid-line" x1={index * 80} y1={0} x2={index * 80} y2={GRAPH_HEIGHT} />
                 ))}
-                {Array.from({ length: 9 }).map((_, index) => (
-                  <line key={`h-${index}`} className="grid-line" x1={0} y1={index * 70} x2={960} y2={index * 70} />
+                {Array.from({ length: Math.floor(GRAPH_HEIGHT / 70) + 1 }).map((_, index) => (
+                  <line key={`h-${index}`} className="grid-line" x1={0} y1={index * 70} x2={GRAPH_WIDTH} y2={index * 70} />
                 ))}
 
                 {nodes.length === 0 ? (
-                  <text x="480" y="280" textAnchor="middle" className="empty-state">
+                  <text x={GRAPH_WIDTH / 2} y={GRAPH_HEIGHT / 2} textAnchor="middle" className="empty-state">
                     Render a graph to see it here.
                   </text>
                 ) : null}
